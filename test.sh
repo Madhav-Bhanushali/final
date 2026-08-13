@@ -652,6 +652,7 @@ START_ALL=$(python3 -c 'import time; print(time.time())')
 
 # Resolve llama-server: env override first, then any existing build dir.
 # If not found, build it once from the vendored llama.cpp fork.
+LLAMA_SERVER="${LLAMA_SERVER:-}"
 if [[ -z "$LLAMA_SERVER" ]]; then
     if LLAMA_SERVER="$(resolve_llama_server)"; then
         echo "Using llama-server: $LLAMA_SERVER"
