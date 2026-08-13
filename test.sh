@@ -268,6 +268,22 @@ build_llama_cli() {
     local nproc_val
     nproc_val="$(nproc 2>/dev/null || echo 4)"
 
+    # The server build may have been run under sudo, leaving root-owned
+    # files that the current user cannot write. Detect and explain.
+    if [[ -d "$bdir" ]] && [[ ! -w "$bdir" ]]; then
+        echo
+        echo "ERROR: build dir exists but is not writable by $USER:"
+        echo "  $bdir"
+        echo
+        echo "It was probably created by 'sudo bash server_benchmark.sh'."
+        echo "Fix ownership and re-run:"
+        echo
+        echo "  sudo chown -R $USER:$USER $bdir"
+        echo "  bash test.sh"
+        echo
+        return 1
+    fi
+
     if [[ ! -f "$bdir/CMakeCache.txt" ]]; then
         cmake -S "$src" -B "$bdir" \
             -DCMAKE_BUILD_TYPE=Release \
