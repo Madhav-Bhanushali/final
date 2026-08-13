@@ -31,6 +31,8 @@
 #   sudo bash server_benchmark.sh            # full install + run all models
 #   sudo bash server_benchmark.sh --download # download all models, then run
 #   bash server_benchmark.sh -m <model>      # run a single model
+#   bash server_benchmark.sh --tests 10      # run only 10 test cases (latency check)
+#   bash server_benchmark.sh -n 128          # cap generated tokens (faster answers)
 #   bash server_benchmark.sh -l              # list discovered models
 #   bash server_benchmark.sh --skip-build    # reuse an existing build
 #
@@ -63,8 +65,9 @@ BUILD_SRC="$REPO_DIR"
 PORT=8080
 THREADS="$(nproc)"
 CONTEXT=2048
-PREDICT=1024
+PREDICT=256
 TIMEOUT_SECONDS=180
+MAX_TESTS=0
 
 REFERENCE_DATE="2026-08-12"
 WINDOW_DAYS=7
@@ -95,6 +98,7 @@ while [[ $# -gt 0 ]]; do
         -t|--threads) THREADS="$2"; shift 2 ;;
         -c|--context) CONTEXT="$2"; shift 2 ;;
         -n|--predict) PREDICT="$2"; shift 2 ;;
+        --tests)      MAX_TESTS="$2"; shift 2 ;;
         --timeout)    TIMEOUT_SECONDS="$2"; shift 2 ;;
         --skip-build) SKIP_BUILD=1; shift ;;
         -l|--list)    LIST_ONLY=1; shift ;;
@@ -651,13 +655,16 @@ run_model() {
         return 1
     fi
 
-    echo "Server ready. Running $(( ${#TESTS[@]} )) tests..."
+    echo "Server ready. Running ${#TESTS[@]} tests (limit $MAX_TESTS)..."
     echo ""
 
     local results_json="["
     local n=1
 
     for t in "${TESTS[@]}"; do
+        if [[ "$MAX_TESTS" -gt 0 && "$n" -gt "$MAX_TESTS" ]]; then
+            break
+        fi
         IFS='|' read -r id category user expected desc <<<"$t"
 
         echo ""
@@ -773,7 +780,7 @@ echo "Reference date : $REFERENCE_DATE"
 echo "Window days    : $WINDOW_DAYS"
 echo "Pending amount : INR $PENDING_AMOUNT"
 echo "Threads        : $THREADS"
-echo "Tests          : ${#TESTS[@]}"
+echo "Tests          : ${#TESTS[@]} (limit $MAX_TESTS)"
 echo ""
 
 install_deps
