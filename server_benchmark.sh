@@ -64,7 +64,7 @@ BUILD_SRC="$REPO_DIR"
 
 PORT=8080
 THREADS="$(nproc)"
-CONTEXT=2048
+CONTEXT=4096
 PREDICT=256
 TIMEOUT_SECONDS=180
 MAX_TESTS=0
@@ -81,10 +81,10 @@ DOWNLOAD_ALL=0
 
 # HF repo for each known model folder -> file name inside the repo.
 declare -A HF_REPOS=(
-    ["Falcon3-1B-Instruct-1.58bit"]="tiiuae/Falcon3-1B-Instruct-1.58bit|ggml-model-i2_s.gguf"
-    ["Falcon3-3B-Instruct-1.58bit"]="tiiuae/Falcon3-3B-Instruct-1.58bit|ggml-model-i2_s.gguf"
-    ["Falcon3-7B-Instruct-1.58bit"]="tiiuae/Falcon3-7B-Instruct-1.58bit|ggml-model-i2_s.gguf"
-    ["Falcon3-10B-Instruct-1.58bit"]="tiiuae/Falcon3-10B-Instruct-1.58bit|ggml-model-i2_s.gguf"
+    ["Falcon3-1B-Instruct-1.58bit"]="tiiuae/Falcon3-1B-Instruct-1.58bit-GGUF|ggml-model-i2_s.gguf"
+    ["Falcon3-3B-Instruct-1.58bit"]="tiiuae/Falcon3-3B-Instruct-1.58bit-GGUF|ggml-model-i2_s.gguf"
+    ["Falcon3-7B-Instruct-1.58bit"]="tiiuae/Falcon3-7B-Instruct-1.58bit-GGUF|ggml-model-i2_s.gguf"
+    ["Falcon3-10B-Instruct-1.58bit"]="tiiuae/Falcon3-10B-Instruct-1.58bit-GGUF|ggml-model-i2_s.gguf"
     ["BitNet-b1.58-2B-4T"]="microsoft/BitNet-b1.58-2B-4T-gguf|ggml-model-i2_s.gguf"
 )
 
@@ -274,14 +274,11 @@ download_models() {
         echo ""
         echo "Downloading $repo (into $target_dir) ..."
         mkdir -p "$target_dir"
-        if [[ "$hf_tool" == "huggingface-cli" ]]; then
-            $hf_tool download "$repo" "$file" \
-                --local-dir "$target_dir" || \
+        if ! $hf_tool download "$repo" "$file" \
+            --local-dir "$target_dir"; then
             echo "WARNING: download failed for $repo"
-        else
-            $hf_tool download "$repo" "$file" \
-                --local-dir "$target_dir" || \
-            echo "WARNING: download failed for $repo"
+            echo "  Check the repo/file name is correct, or download"
+            echo "  manually and place the .gguf into $target_dir"
         fi
     done
     echo ""
@@ -709,20 +706,32 @@ $user
 ASSISTANT:
 "
 
-        local start_time end_time elapsed raw
+        local start_time end_time elapsed raw http_code
         start_time="$(date +%s%N)"
 
-        raw="$(curl -sf --max-time "$TIMEOUT_SECONDS" \
+        # Do NOT use curl -f here: a 4xx/5xx from the server carries the
+        # real error in the body (e.g. "prompt too long"), which we want
+        # to see and record instead of discarding.
+        local resp_file="$TEMP_DIR/completion_${n}.json"
+        http_code="$(curl -s -o "$resp_file" -w '%{http_code}' \
+            --max-time "$TIMEOUT_SECONDS" \
             -H 'Content-Type: application/json' \
             -d "$(jq -n \
                 --arg p "$prompt" \
                 --argjson np "$PREDICT" \
                 '{prompt:$p, n_predict:$np, temperature:0.2, seed:42, cache_prompt:false}' \
             )" \
-            "http://127.0.0.1:$port/completion" 2>/dev/null | jq -r '.content // ""' || true)"
+            "http://127.0.0.1:$port/completion" 2>/dev/null || true)"
+        raw="$(jq -r '.content // ""' "$resp_file" 2>/dev/null || true)"
 
         end_time="$(date +%s%N)"
         elapsed=$(( (end_time - start_time) / 1000000 ))
+
+        if [[ "$http_code" != "200" ]] || [[ -z "$raw" ]]; then
+            echo "HTTP $http_code - server response:"
+            head -c 500 "$resp_file" 2>/dev/null || true
+            echo ""
+        fi
 
         local parse_file="$TEMP_DIR/parse_${n}.txt"
         parse_response "$raw" "$parse_file"
