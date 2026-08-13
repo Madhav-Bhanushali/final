@@ -15,15 +15,19 @@
 #
 # Usage:
 #   ./test.sh                          # run all models (default)
-#   ./test.sh --model bitnet-2b        # run one model
-#   ./test.sh --model f3-3b --predict 96
+#   ./test.sh --model f3-7b            # run one model
+#   ./test.sh --model qwen3-8b --predict 96
 #   ./test.sh --list                   # list catalog + tests
 #
 set -uo pipefail
 
 MODEL="all"
-THREADS=4
-TIMEOUT_SECONDS=120
+# Default to one thread per logical CPU core. Override with --threads or the
+# THREADS env var. Extra threads speed up both prompt and generation for CPU
+# inference (parallelism happens inside the single model server).
+THREADS="${THREADS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 4)}"
+# Max per-request wall-clock; a request that exceeds it is flagged timed_out.
+TIMEOUT_SECONDS=60
 ALL=0
 LIST=0
 DOWNLOAD_ONLY=0
@@ -35,12 +39,11 @@ usage() {
     cat <<'USAGE'
 Usage: ./test.sh [options]
 
-  --model NAME        bitnet-2b | f3-1b | f3-3b | f3-7b | f3-10b |
-                      ds-r1-1.5b | llama3.1-8b | mistral-7b | qwen3-8b |
-                      gemma3-12b | ternary-8b | all (default: all)
-  --threads N           default: 4
+  --model NAME        f3-7b | ds-r1-1.5b | llama3.1-8b | qwen3-8b |
+                      gemma3-12b | gemma-3b | ternary-8b | all (default: all)
+  --threads N           threads per model (default: # logical CPUs)
   --predict N           max output-token override (default: 0 = use per-model Predict)
-  --timeout SECONDS    default: 120
+  --timeout SECONDS    default: 60
   --no-think|--think    drop/enable chain-of-thought (default: drop)
   --all                 run every model in the catalog (same as --model all)
   --list                 list models and tests, then exit
@@ -97,87 +100,63 @@ rm -f "$RESULTS_JSONL"
 # 1.58-bit BitNet I2_S models first, then standard Q4 models.
 # ============================================================
 
-CATALOG_KEYS=(f3-1b f3-3b f3-7b f3-10b ds-r1-1.5b llama3.1-8b mistral-7b qwen3-8b gemma3-12b ternary-8b)
+CATALOG_KEYS=(f3-7b ds-r1-1.5b llama3.1-8b qwen3-8b gemma3-12b gemma-3b ternary-8b)
 
 # Path to the .gguf inside ./models/ (used when the file is already present).
 declare -A CATALOG_PATH=(
-    [bitnet-2b]="BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf"
-    [f3-1b]="Falcon3-1B-Instruct-1.58bit/ggml-model-i2_s.gguf"
-    [f3-3b]="Falcon3-3B-Instruct-1.58bit/ggml-model-i2_s.gguf"
     [f3-7b]="Falcon3-7B-Instruct-1.58bit/ggml-model-i2_s.gguf"
-    [f3-10b]="Falcon3-10B-Instruct-1.58bit/ggml-model-i2_s.gguf"
     [ds-r1-1.5b]="DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf"
     [llama3.1-8b]="standard/Llama-3.1-8B-Instruct-Q4_K_M.gguf"
-    [mistral-7b]="standard/Mistral-7B-Instruct-v0.3-Q4_K_M.gguf"
     [qwen3-8b]="standard/Qwen3-8B-Q4_K_M.gguf"
     [gemma3-12b]="standard/gemma-3-12b-it-Q4_K_M.gguf"
+    [gemma-3b]="standard/gemma-3b-it-expanded.Q4_K_M.gguf"
     [ternary-8b]="standard/Ternary-Bonsai-8B-Q2_0.gguf"
 )
 
 # HF repo + file for download when the local model is missing.
 declare -A CATALOG_REPO=(
-    [bitnet-2b]="microsoft/BitNet-b1.58-2B-4T-gguf"
-    [f3-1b]="tiiuae/Falcon3-1B-Instruct-1.58bit-GGUF"
-    [f3-3b]="tiiuae/Falcon3-3B-Instruct-1.58bit-GGUF"
     [f3-7b]="tiiuae/Falcon3-7B-Instruct-1.58bit-GGUF"
-    [f3-10b]="tiiuae/Falcon3-10B-Instruct-1.58bit-GGUF"
     [ds-r1-1.5b]="bartowski/DeepSeek-R1-Distill-Qwen-1.5B-GGUF"
     [llama3.1-8b]="bartowski/Meta-Llama-3.1-8B-Instruct-GGUF"
-    [mistral-7b]="bartowski/Mistral-7B-Instruct-v0.3-GGUF"
     [qwen3-8b]="bartowski/Qwen_Qwen3-8B-GGUF"
     [gemma3-12b]="bartowski/gemma-3-12b-it-GGUF"
-    [ternary-8b]="timdettmers/Ternary-Bonsai-8B-GGUF"
+    [gemma-3b]="mradermacher/gemma-3b-it-expanded-GGUF"
+    [ternary-8b]="prism-ml/Ternary-Bonsai-8B-gguf"
 )
 declare -A CATALOG_FILE=(
-    [bitnet-2b]="ggml-model-i2_s.gguf"
-    [f3-1b]="ggml-model-i2_s.gguf"
-    [f3-3b]="ggml-model-i2_s.gguf"
     [f3-7b]="ggml-model-i2_s.gguf"
-    [f3-10b]="ggml-model-i2_s.gguf"
     [ds-r1-1.5b]="DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf"
     [llama3.1-8b]="Llama-3.1-8B-Instruct-Q4_K_M.gguf"
-    [mistral-7b]="Mistral-7B-Instruct-v0.3-Q4_K_M.gguf"
     [qwen3-8b]="Qwen_Qwen3-8B-Q4_K_M.gguf"
     [gemma3-12b]="gemma-3-12b-it-Q4_K_M.gguf"
+    [gemma-3b]="gemma-3b-it-expanded.Q4_K_M.gguf"
     [ternary-8b]="Ternary-Bonsai-8B-Q2_0.gguf"
 )
 declare -A CATALOG_CTX=(
-    [bitnet-2b]=4096
-    [f3-1b]=4096
-    [f3-3b]=4096
     [f3-7b]=4096
-    [f3-10b]=4096
     [ds-r1-1.5b]=8192
     [llama3.1-8b]=8192
-    [mistral-7b]=8192
     [qwen3-8b]=8192
     [gemma3-12b]=8192
+    [gemma-3b]=8192
     [ternary-8b]=8192
 )
 declare -A CATALOG_PREDICT=(
-    [bitnet-2b]=128
-    [f3-1b]=128
-    [f3-3b]=128
     [f3-7b]=128
-    [f3-10b]=128
     [ds-r1-1.5b]=256
     [llama3.1-8b]=256
-    [mistral-7b]=256
     [qwen3-8b]=256
     [gemma3-12b]=256
+    [gemma-3b]=256
     [ternary-8b]=256
 )
 declare -A CATALOG_NOTE=(
-    [bitnet-2b]="BitNet b1.58 2B (1.58-bit I2_S)"
-    [f3-1b]="Falcon3 1B Instruct (1.58-bit I2_S)"
-    [f3-3b]="Falcon3 3B Instruct (1.58-bit I2_S)"
     [f3-7b]="Falcon3 7B Instruct (1.58-bit I2_S)"
-    [f3-10b]="Falcon3 10B Instruct (1.58-bit I2_S)"
     [ds-r1-1.5b]="DeepSeek R1 Distill 1.5B (Q4_K_M)"
     [llama3.1-8b]="Llama 3.1 8B Instruct (Q4_K_M)"
-    [mistral-7b]="Mistral 7B Instruct v0.3 (Q4_K_M)"
     [qwen3-8b]="Qwen3 8B (Q4_K_M)"
     [gemma3-12b]="Gemma 3 12B IT (Q4_K_M)"
+    [gemma-3b]="Gemma 3B IT Expanded (Q4_K_M)"
     [ternary-8b]="Ternary Bonsai 8B (Q2_0)"
 )
 
@@ -188,16 +167,12 @@ declare -A CATALOG_NOTE=(
 # fine-tunes emit bare user/assistant lines instead of their templated special
 # tokens when hallucinating a second turn.
 declare -A CATALOG_STOP=(
-    [bitnet-2b]='["<|end_of_text|>", "Human: ", "\nuser\n", "\nassistant\n"]'
-    [f3-1b]='["<|endoftext|>", "<|user|>", "\nuser\n", "\nassistant\n"]'
-    [f3-3b]='["<|endoftext|>", "<|user|>", "\nuser\n", "\nassistant\n"]'
     [f3-7b]='["<|endoftext|>", "<|user|>", "\nuser\n", "\nassistant\n"]'
-    [f3-10b]='["<|endoftext|>", "<|user|>", "\nuser\n", "\nassistant\n"]'
     [ds-r1-1.5b]='["<|endoftext|>", "\nuser\n", "\nassistant\n"]'
     [llama3.1-8b]='["<|eot_id|>", "<|start_header_id|>user<|end_header_id|>", "\nuser\n", "\nassistant\n"]'
-    [mistral-7b]='["</s>", "[INST]", "\nuser\n", "\nassistant\n"]'
     [qwen3-8b]='["<|im_end|>", "<|im_start|>user", "\nuser\n", "\nassistant\n"]'
     [gemma3-12b]='["<end_of_turn>", "<start_of_turn>user", "\nuser\n", "\nassistant\n"]'
+    [gemma-3b]='["<end_of_turn>", "<start_of_turn>user", "\nuser\n", "\nassistant\n"]'
     [ternary-8b]='["<|im_end|>", "<|im_start|>user", "\nuser\n", "\nassistant\n"]'
 )
 
@@ -391,10 +366,17 @@ start_server() {
     local ctx="${CATALOG_CTX[$model_name]}"
 
     local logfile="$TEMP_DIR/${model_name}_server.log"
+    # Threading: -t drives per-token generation, -tb drives prompt processing.
+    # Larger batch/ubatch lets the prompt tokens be evaluated with full thread
+    # parallelism instead of serializing. All models stay sequential - the
+    # concurrency happens inside this single llama-server.
     "$LLAMA_SERVER" \
         -m "$model_path" \
         -c "$ctx" \
         -t "$THREADS" \
+        -tb "$THREADS" \
+        -b 4096 \
+        -ub 2048 \
         --port "$port" \
         --host 127.0.0.1 \
         --no-webui \
@@ -452,9 +434,9 @@ run_test() {
 
     # /v1/chat/completions renders the model's own chat template, so the
     # prompt uses the correct role tokens and generation stops at the real
-    # end-of-turn/EOS. Some templates (bitnet-2b, mistral-7b) ignore or even
-    # error on a "system" role, so the system prompt is folded into the user
-    # message for every model - uniform and safe.
+    # end-of-turn/EOS. Some templates ignore or even error on a "system" role,
+    # so the system prompt is folded into the user message for every model -
+    # uniform and safe.
     local user_content="$system_prompt
 
 CUSTOMER MESSAGE:
@@ -529,7 +511,7 @@ $t_user"
     echo "------------------------------------------------------------"
 
     python3 - "$model_name" "$t_id" "$t_cat" "$t_desc" "$t_user" "$t_expected" \
-             "$exit_code" "$timed_out" "$elapsed" "$ctx" "$predict" "$stdout" "$RESULTS_JSONL" \
+             "$exit_code" "$timed_out" "$elapsed" "$ctx" "$predict" "$stdout" "$out_jsonl" \
              "$p_ms" "$g_ms" "$c_n" "$p_n" "$t_conn" "$t_ttfb" <<'PY'
 import sys, json, re
 
@@ -653,7 +635,9 @@ PY
 # ============================================================
 
 run_model() {
-    local model_name="$1"
+    local model_name="$1" port="$2"
+
+    local out_jsonl="${MODEL_JSONL:-$RESULTS_JSONL}"
 
     echo
     echo "############################################################"
@@ -679,8 +663,6 @@ run_model() {
     if [[ $DOWNLOAD_ONLY -eq 1 ]]; then
         return 0
     fi
-
-    local port=$((PORT + (RANDOM % 100)))
 
     local server_pid
     if ! server_pid="$(start_server "$model_name" "$model_path" "$port")"; then
@@ -753,6 +735,8 @@ if [[ "$ALL" -eq 1 || "$MODEL" == "all" ]]; then
     echo
     echo "Models : ${#CATALOG_KEYS[@]}"
     echo "Tests  : ${#TESTS[@]}"
+    echo "Threads: $THREADS (generation + prompt batch)"
+    echo "Timeout: $TIMEOUT_SECONDS seconds per request"
     echo
 
     m=1
@@ -762,11 +746,11 @@ if [[ "$ALL" -eq 1 || "$MODEL" == "all" ]]; then
         echo "MODEL $m / ${#CATALOG_KEYS[@]}"
         echo "$k - ${CATALOG_NOTE[$k]}"
         echo "============================================================"
-        run_model "$k"
+        run_model "$k" "$((PORT + m))"
         m=$((m+1))
     done
 else
-    run_model "$MODEL"
+    run_model "$MODEL" "$((PORT + 1))"
 fi
 
 # ============================================================
