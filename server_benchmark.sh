@@ -515,23 +515,25 @@ parse_response() {
             if type == "object" and (.decision != null) then "yes" else "no" end
         ' 2>/dev/null || true)"
         if [[ "$is_obj" == "yes" ]]; then
-            decision="$(printf '%s' "$text" | jq -r '.decision // ""' 2>/dev/null)"
-            pdate="$(printf '%s' "$text" | jq -r '.payment_date // ""' 2>/dev/null)"
-            within="$(printf '%s' "$text" | jq -r '.within_seven_days // ""' 2>/dev/null)"
-            resp="$(printf '%s' "$text" | jq -r '.response // ""' 2>/dev/null)"
+            decision="$(printf '%s' "$text" | jq -r '.decision // ""' 2>/dev/null || true)"
+            pdate="$(printf '%s' "$text" | jq -r '.payment_date // ""' 2>/dev/null || true)"
+            within="$(printf '%s' "$text" | jq -r '.within_seven_days // ""' 2>/dev/null || true)"
+            resp="$(printf '%s' "$text" | jq -r '.response // ""' 2>/dev/null || true)"
             valid=1
         fi
     fi
 
     # Fall back to regex when the model wrapped/truncated the JSON.
+    # Every pipeline is guarded with "|| true": under `set -e -o pipefail`
+    # an unmatched grep would otherwise abort the whole benchmark silently.
     if [[ "$valid" -eq 0 ]]; then
         local m
-        m="$(printf '%s' "$text" | tr -d '\r')"
+        m="$(printf '%s' "$text" | tr -d '\r' || true)"
         if [[ -z "$decision" ]]; then
-            decision="$(printf '%s' "$m" | grep -oE '"decision"[[:space:]]*:[[:space:]]*"[^"]+"' | head -n1 | sed -E 's/.*"decision"[[:space:]]*:[[:space:]]*"([^"]+)"/\1/')"
+            decision="$(printf '%s' "$m" | grep -oE '"decision"[[:space:]]*:[[:space:]]*"[^"]+"' | head -n1 | sed -E 's/.*"decision"[[:space:]]*:[[:space:]]*"([^"]+)"/\1/' || true)"
         fi
         if [[ -z "$pdate" ]]; then
-            pdate="$(printf '%s' "$m" | grep -oE '"payment_date"[[:space:]]*:[[:space:]]*"[^"]+"' | head -n1 | sed -E 's/.*"payment_date"[[:space:]]*:[[:space:]]*"([^"]+)"/\1/')"
+            pdate="$(printf '%s' "$m" | grep -oE '"payment_date"[[:space:]]*:[[:space:]]*"[^"]+"' | head -n1 | sed -E 's/.*"payment_date"[[:space:]]*:[[:space:]]*"([^"]+)"/\1/' || true)"
         fi
         if [[ "$within" == "null" ]]; then
             local w
@@ -539,7 +541,7 @@ parse_response() {
             if [[ -n "$w" ]]; then within="$w"; fi
         fi
         if [[ -z "$resp" ]]; then
-            resp="$(printf '%s' "$m" | grep -oE '"response"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n1 | sed -E 's/.*"response"[[:space:]]*:[[:space:]]*"([^"]*)"/\1/')"
+            resp="$(printf '%s' "$m" | grep -oE '"response"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n1 | sed -E 's/.*"response"[[:space:]]*:[[:space:]]*"([^"]*)"/\1/' || true)"
         fi
 
         # A decision that is one of the valid values counts as valid JSON.
@@ -656,6 +658,30 @@ run_model() {
     fi
 
     echo "Server ready. Running ${#TESTS[@]} tests (limit $MAX_TESTS)..."
+    echo ""
+
+    # Smoke test: one tiny request with a strict timeout so a broken
+    # server fails fast and loudly instead of silently killing the run.
+    local smoke_start smoke_raw smoke_code smoke_ms
+    smoke_start="$(date +%s%N)"
+    smoke_code=""
+    smoke_raw="$(curl -s --max-time 30 \
+        -H 'Content-Type: application/json' \
+        -d '{"prompt":"Hi. Reply OK.","n_predict":1,"temperature":0.2,"seed":42,"cache_prompt":false}' \
+        "http://127.0.0.1:$port/completion" 2>/dev/null)" || smoke_code=$?
+    smoke_ms=$(( ($(date +%s%N) - smoke_start) / 1000000 ))
+    if [[ -n "$smoke_raw" ]] && [[ "$smoke_raw" != *"error"* ]]; then
+        echo "SMOKE: /completion OK in ${smoke_ms} ms -> $(printf '%s' "$smoke_raw" | jq -r '.content // ""' 2>/dev/null || echo '(no content)')"
+    else
+        echo "SMOKE FAILED after ${smoke_ms} ms (curl exit $smoke_code)"
+        echo "--- last 20 lines of server log ---"
+        tail -n 20 "$TEMP_DIR/server_$(basename "$path").log"
+        echo "-----------------------------------"
+        echo "Likely causes: model file corrupt/truncated, wrong quantization,"
+        echo "or the server crashed on first request."
+        kill "$server_pid" 2>/dev/null || true
+        return 1
+    fi
     echo ""
 
     local results_json="["
