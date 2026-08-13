@@ -503,6 +503,7 @@ $t_user"
     else
         echo "ERROR (HTTP $http_code): no reply received"
     fi
+    printf 'Time: %ss\n' "$elapsed"
 
     # Timing/cache fields from the server response. Zero when the request
     # failed or the server did not include a timings object.
@@ -622,6 +623,7 @@ with open(results_txt, "a", encoding="utf-8") as f:
     f.write(f"TEST: {t_id} ({t_cat})\n")
     f.write(f"User: {t_user}\n")
     f.write(f"Result: {verdict}  {reason}\n")
+    f.write(f"Time: {elapsed}s\n")
     f.write(f"Reply:\n{response if response else '(no reply)'}\n")
 PY
 
@@ -663,10 +665,16 @@ run_model() {
     fi
 
     local server_pid
+    local server_start_ts
+    server_start_ts=$(python3 -c 'import time; print(time.time())')
     if ! server_pid="$(start_server "$model_name" "$model_path" "$port")"; then
         echo "ERROR: failed to start llama-server for $model_name"
         return 1
     fi
+    local server_ready_s
+    server_ready_s="$(python3 -c 'import time,sys; print(round(time.time()-float(sys.argv[1]),1))' "$server_start_ts" 2>/dev/null || echo 0)"
+    echo "Model load + server start: ${server_ready_s}s (one-time; model stays resident for all ${#TESTS[@]} tests)"
+    echo
 
     local n=1
     for test_line in "${TESTS[@]}"; do
