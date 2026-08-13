@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 #
-# BANK LOAN COLLECTION BENCHMARK — Linux port
-# Uses only llama-cli flags verified with the Windows build: -m -f -n -c -t -st
+# BANK LOAN COLLECTION BENCHMARK - llama-server edition
+# Loads each model ONCE into a resident llama-server (RAM) and runs all
+# tests over HTTP. Uses prompt-prefix caching so the static system prompt
+# is processed only once per model, a hard output token cap, and drops
+# chain-of-thought. Greatly reduces per-request latency vs llama-cli.
 #
-# Requires: python3, curl, coreutils `timeout`
-# llama-cli binary path defaults to $ROOT/build/bin/llama-cli — override with:
-#   LLAMA_BIN=/path/to/llama-cli ./loan_collection_benchmark.sh ...
+# Requires: python3, curl, jq
+# llama-server binary: auto-detected from build_server/bin or build/bin,
+# or auto-built. Override with LLAMA_SERVER=/path/to/llama-server.
 #
 # Usage:
 #   ./test.sh                          # run all models (default)
 #   ./test.sh --model bitnet-2b        # run one model
-#   ./test.sh --model f3-3b --timeout 300
+#   ./test.sh --model f3-3b --predict 96
 #   ./test.sh --list                   # list catalog + tests
 #
 set -uo pipefail
@@ -21,6 +24,9 @@ TIMEOUT_SECONDS=300
 ALL=0
 LIST=0
 DOWNLOAD_ONLY=0
+PORT=8080
+MAX_PREDICT=80
+NO_THINK=1
 
 usage() {
     cat <<'USAGE'
@@ -30,7 +36,9 @@ Usage: ./test.sh [options]
                       ds-r1-1.5b | llama3.1-8b | mistral-7b | qwen3-8b |
                       gemma3-12b | ternary-8b | all (default: all)
   --threads N           default: 4
+  --predict N           hard cap on output tokens (default: 80)
   --timeout SECONDS    default: 300
+  --no-think|--think    drop/enable chain-of-thought (default: drop)
   --all                 run every model in the catalog (same as --model all)
   --list                 list models and tests, then exit
   --download-only        only download the model, don't run tests
@@ -42,7 +50,10 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --model) MODEL="$2"; shift 2 ;;
         --threads) THREADS="$2"; shift 2 ;;
+        --predict) MAX_PREDICT="$2"; shift 2 ;;
         --timeout) TIMEOUT_SECONDS="$2"; shift 2 ;;
+        --no-think) NO_THINK=1; shift ;;
+        --think) NO_THINK=0; shift ;;
         --all) ALL=1; shift ;;
         --list) LIST=1; shift ;;
         --download-only) DOWNLOAD_ONLY=1; shift ;;
@@ -57,8 +68,6 @@ TEMP_DIR="$ROOT/benchmark_temp"
 RESULTS_JSONL="$ROOT/benchmark_results.jsonl"
 RESULTS_CSV="$ROOT/benchmark_results.csv"
 RESULTS_JSON="$ROOT/benchmark_results.json"
-
-LLAMA_BIN="${LLAMA_BIN:-}"
 
 mkdir -p "$MODELS_DIR" "$TEMP_DIR"
 
@@ -246,74 +255,8 @@ fi
 # LLAMA BINARY RESOLUTION + BUILD
 # ============================================================
 
-# Find an existing llama-cli in any build dir produced by this repo
-# (server_benchmark.sh builds into build_server, the CMake default
-# build/ is used by the Windows Visual Studio build).
-resolve_llama_cli() {
-    local candidates=(
-        "$ROOT/build_server/bin/llama-cli"
-        "$ROOT/build/bin/llama-cli"
-        "$ROOT/build_server/bin/Release/llama-cli"
-        "$ROOT/build/bin/Release/llama-cli"
-    )
-    local c
-    for c in "${candidates[@]}"; do
-        if [[ -x "$c" ]]; then
-            echo "$c"
-            return 0
-        fi
-    done
-    return 1
-}
-
-# Build llama-cli from the vendored llama.cpp fork (used by the
-# I2_S / 1.58-bit Falcon3 + BitNet models). Reuses an existing
-# build dir if present, otherwise configures a fresh one.
-build_llama_cli() {
-    echo
-    echo "Building llama-cli (this can take a few minutes)..."
-    echo
-
-    local src="$ROOT"
-    if [[ ! -f "$ROOT/CMakeLists.txt" ]]; then
-        echo "ERROR: repo root with CMakeLists.txt not found at $ROOT"
-        echo "  Clone with: git clone --recurse-submodules https://github.com/Madhav-Bhanushali/final"
-        return 1
-    fi
-
-    local bdir="$ROOT/build_server"
-    local nproc_val
-    nproc_val="$(nproc 2>/dev/null || echo 4)"
-
-    # The server build may have been run under sudo, leaving root-owned
-    # files that the current user cannot write. Detect and explain.
-    if [[ -d "$bdir" ]] && [[ ! -w "$bdir" ]]; then
-        echo
-        echo "ERROR: build dir exists but is not writable by $USER:"
-        echo "  $bdir"
-        echo
-        echo "It was probably created by 'sudo bash server_benchmark.sh'."
-        echo "Fix ownership and re-run:"
-        echo
-        echo "  sudo chown -R $USER:$USER $bdir"
-        echo "  bash test.sh"
-        echo
-        return 1
-    fi
-
-    if [[ ! -f "$bdir/CMakeCache.txt" ]]; then
-        cmake -S "$src" -B "$bdir" \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DGGML_NATIVE=ON \
-            -DLLAMA_BUILD_SERVER=ON \
-            -DLLAMA_BUILD_COMMON=ON \
-            -DLLAMA_BUILD_TOOLS=ON
-    fi
-
-    cmake --build "$bdir" --target llama-cli --config Release -j "$nproc_val"
-    local exe="$bdir/bin/llama-cli"
-    [[ -x "$exe" ]] && echo "Built: $exe"
-}
+# (llama-cli resolve/build helpers were removed when test.sh moved to
+# the resident llama-server model - see SERVER MANAGEMENT below.)
 
 # ============================================================
 # DOWNLOAD
@@ -356,69 +299,202 @@ get_model() {
 }
 
 # ============================================================
-# RUN ONE TEST
+# SERVER MANAGEMENT  (llama-server resident in RAM)
+# ============================================================
+
+resolve_llama_server() {
+    local candidates=(
+        "$ROOT/build_server/bin/llama-server"
+        "$ROOT/build/bin/llama-server"
+        "$ROOT/build_server/bin/Release/llama-server"
+        "$ROOT/build/bin/Release/llama-server"
+    )
+    local c
+    for c in "${candidates[@]}"; do
+        if [[ -x "$c" ]]; then
+            echo "$c"
+            return 0
+        fi
+    done
+    return 1
+}
+
+build_llama_server() {
+    echo
+    echo "Building llama-server (this can take a few minutes)..."
+    echo
+
+    local src="$ROOT"
+    if [[ ! -f "$ROOT/CMakeLists.txt" ]]; then
+        echo "ERROR: repo root with CMakeLists.txt not found at $ROOT"
+        return 1
+    fi
+
+    local bdir="$ROOT/build_server"
+    local nproc_val
+    nproc_val="$(nproc 2>/dev/null || echo 4)"
+
+    if [[ -d "$bdir" ]] && [[ ! -w "$bdir" ]]; then
+        echo
+        echo "ERROR: build dir exists but is not writable by $USER: $bdir"
+        echo "Fix: sudo chown -R $USER:$USER $bdir"
+        return 1
+    fi
+
+    if [[ ! -f "$bdir/CMakeCache.txt" ]]; then
+        cmake -S "$src" -B "$bdir" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_NATIVE=ON \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_COMMON=ON \
+            -DLLAMA_BUILD_TOOLS=ON
+    fi
+
+    cmake --build "$bdir" --target llama-server --config Release -j "$nproc_val"
+    local exe="$bdir/bin/llama-server"
+    [[ -x "$exe" ]] && echo "Built: $exe"
+}
+
+wait_server_ready() {
+    local port="$1"
+    local attempts=600
+    local i
+    for ((i=0; i<attempts; i++)); do
+        if curl -sf "http://127.0.0.1:$port/health" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.5
+    done
+    return 1
+}
+
+start_server() {
+    local model_name="$1" model_path="$2" port="$3"
+    local ctx="${CATALOG_CTX[$model_name]}"
+
+    local logfile="$TEMP_DIR/${model_name}_server.log"
+    "$LLAMA_SERVER" \
+        -m "$model_path" \
+        -c "$ctx" \
+        -t "$THREADS" \
+        --port "$port" \
+        --host 127.0.0.1 \
+        --no-webui \
+        --temp 0.2 \
+        --seed 42 \
+        --parallel 1 \
+        >"$logfile" 2>&1 &
+    local pid=$!
+
+    if ! wait_server_ready "$port"; then
+        echo "ERROR: server did not become ready on port $port"
+        tail -n 30 "$logfile"
+        kill "$pid" 2>/dev/null || true
+        return 1
+    fi
+
+    echo "Started llama-server (pid $pid) on port $port - model resident in RAM"
+    echo "$pid"
+    return 0
+}
+
+stop_server() {
+    local pid="$1"
+    echo "Stopping llama-server (pid $pid)..."
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+}
+
+# ============================================================
+# RUN ONE TEST  (over HTTP, reuses resident KV cache)
 # ============================================================
 
 run_test() {
-    local model_name="$1" model_path="$2" test_line="$3"
+    local model_name="$1" port="$2" test_line="$3"
 
     IFS='|' read -r t_id t_cat t_user t_expected t_desc <<< "$test_line"
 
-    local prompt_file="$TEMP_DIR/${model_name}_${t_id}.txt"
+    local ctx="${CATALOG_CTX[$model_name]}"
+    local predict="${CATALOG_PREDICT[$model_name]}"
+    if [[ "$MAX_PREDICT" -gt 0 && "$MAX_PREDICT" -lt "$predict" ]]; then
+        predict="$MAX_PREDICT"
+    fi
 
-    {
-        printf '%s\n\n' "$SYSTEM_PROMPT"
-        printf 'CUSTOMER MESSAGE:\n%s\n\n' "$t_user"
-        printf 'ASSISTANT:\n'
-    } > "$prompt_file"
+    # Reasoning models spew chain-of-thought tokens first. With --no-think
+    # we hard-cap output so the answer/JSON must appear inside the cap.
+    local system_prompt="$SYSTEM_PROMPT"
+    if [[ "$NO_THINK" -eq 1 ]]; then
+        case "$model_name" in
+            qwen3-8b)
+                system_prompt+=$'\n\nIMPORTANT: Do not think step by step. Do not include any thinking content. Output only JSON.'
+                ;;
+        esac
+    fi
+
+    local prompt="$system_prompt
+
+CUSTOMER MESSAGE:
+$t_user
+
+ASSISTANT:
+"
 
     echo
     echo "BOT:"
     echo "------------------------------------------------------------"
 
-    local ctx="${CATALOG_CTX[$model_name]}"
-    local predict="${CATALOG_PREDICT[$model_name]}"
-    local stdout_file="$TEMP_DIR/${model_name}_${t_id}.out"
-    local stderr_file="$TEMP_DIR/${model_name}_${t_id}.err"
-
+    local resp_file="$TEMP_DIR/${model_name}_${t_id}.json"
     local start_ts
     start_ts=$(python3 -c 'import time; print(time.time())')
 
-    timeout --signal=KILL "${TIMEOUT_SECONDS}s" \
-        "$LLAMA_BIN" -m "$model_path" -f "$prompt_file" -n "$predict" -c "$ctx" -t "$THREADS" -st \
-        > "$stdout_file" 2> "$stderr_file"
-    local exit_code=$?
+    # cache_prompt=true keeps the shared system-prompt prefix in the KV
+    # cache; llama-server skips re-processing it for every customer message.
+    local http_code
+    http_code="$(curl -s -o "$resp_file" -w '%{http_code}' --max-time "$TIMEOUT_SECONDS" \
+        -H 'Content-Type: application/json' \
+        -d "$(jq -n \
+            --arg p "$prompt" \
+            --argjson np "$predict" \
+            '{prompt:$p, n_predict:$np, temperature:0.2, seed:42, cache_prompt:true}' \
+        )" \
+        "http://127.0.0.1:$port/completion" 2>/dev/null || true)"
 
+    local elapsed
+    elapsed=$(python3 -c "print(round(time.time() - $start_ts, 2))")
+
+    local stdout=""
+    if [[ "$http_code" == "200" ]]; then
+        stdout="$(jq -r '.content // ""' "$resp_file" 2>/dev/null || true)"
+    else
+        echo "HTTP $http_code:"
+        head -c 400 "$resp_file" 2>/dev/null || true
+        echo ""
+    fi
+
+    local exit_code=0
     local timed_out=0
-    if [[ $exit_code -eq 137 || $exit_code -eq 124 ]]; then
+    if [[ "$http_code" != "200" ]]; then
+        exit_code=1
+    fi
+    if [[ "$http_code" == "000" ]]; then
         timed_out=1
     fi
 
-    cat "$stdout_file"
-    if [[ -s "$stderr_file" ]]; then
-        echo "[llama stderr]"
-        cat "$stderr_file"
-    fi
+    printf '%s\n' "$stdout"
     echo "------------------------------------------------------------"
 
     python3 - "$model_name" "$t_id" "$t_cat" "$t_desc" "$t_user" "$t_expected" \
-             "$exit_code" "$timed_out" "$start_ts" "$ctx" "$predict" "$TIMEOUT_SECONDS" \
-             "$stdout_file" "$stderr_file" "$RESULTS_JSONL" <<'PY'
-import sys, json, re, time
+             "$exit_code" "$timed_out" "$elapsed" "$ctx" "$predict" "$stdout" "$RESULTS_JSONL" <<'PY'
+import sys, json, re
 
 (model_name, t_id, t_cat, t_desc, t_user, t_expected,
- exit_code, timed_out, start_ts, ctx, predict, timeout_seconds,
- stdout_file, stderr_file, results_jsonl) = sys.argv[1:16]
+ exit_code, timed_out, elapsed, ctx, predict, stdout, results_jsonl) = sys.argv[1:14]
 
 exit_code = int(exit_code)
 timed_out = bool(int(timed_out))
-elapsed = round(time.time() - float(start_ts), 2)
+elapsed = float(elapsed)
 ctx = int(ctx)
 predict = int(predict)
-timeout_seconds = int(timeout_seconds)
-
-with open(stdout_file, "r", errors="replace") as f:
-    stdout = f.read()
 
 VALID_DECISIONS = {"ACCEPT","OUTSIDE_WINDOW","CLARIFY","REDIRECT","POLITE_REDIRECT","SAFE_RESPONSE"}
 UNSAFE_PATTERNS = [
@@ -432,6 +508,8 @@ def parse_response(text):
     if not text or not text.strip():
         return r
     clean = re.sub(r"<\|.*?\|>", "", text.strip()).strip()
+    # Strip reasoning blocks if a reasoning model leaked any.
+    clean = re.sub(r"<think>.*?</think>", "", clean, flags=re.S).strip()
 
     def fill(j):
         r["valid_json"] = True
@@ -483,10 +561,10 @@ def evaluate(parsed, expected):
 
 if timed_out:
     parsed = {"valid_json": False, "decision": "", "payment_date": "", "within_window": None, "response": stdout}
-    ok, reason = False, f"Timeout after {timeout_seconds} seconds"
+    ok, reason = False, "Timeout"
 elif exit_code != 0 and not stdout.strip():
     parsed = {"valid_json": False, "decision": "", "payment_date": "", "within_window": None, "response": ""}
-    ok, reason = False, f"llama-cli exited with code {exit_code}"
+    ok, reason = False, f"HTTP error (code {exit_code})"
 else:
     parsed = parse_response(stdout)
     ok, reason = evaluate(parsed, t_expected)
@@ -512,7 +590,7 @@ PY
 }
 
 # ============================================================
-# RUN ONE MODEL
+# RUN ONE MODEL  (server loaded once, all tests over HTTP)
 # ============================================================
 
 run_model() {
@@ -525,7 +603,7 @@ run_model() {
     echo
     echo "Note        : ${CATALOG_NOTE[$model_name]}"
     echo "Context     : ${CATALOG_CTX[$model_name]}"
-    echo "Max tokens  : ${CATALOG_PREDICT[$model_name]}"
+    echo "Max tokens  : ${CATALOG_PREDICT[$model_name]} (hard cap $MAX_PREDICT)"
     echo "Threads     : $THREADS"
     echo "Timeout     : $TIMEOUT_SECONDS seconds"
     echo
@@ -536,6 +614,14 @@ run_model() {
 
     if [[ $DOWNLOAD_ONLY -eq 1 ]]; then
         return 0
+    fi
+
+    local port=$((PORT + (RANDOM % 100)))
+
+    local server_pid
+    if ! server_pid="$(start_server "$model_name" "$model_path" "$port")"; then
+        echo "ERROR: failed to start llama-server for $model_name"
+        return 1
     fi
 
     local n=1
@@ -550,10 +636,12 @@ run_model() {
         echo "USER:"
         echo "$t_user"
 
-        run_test "$model_name" "$model_path" "$test_line"
+        run_test "$model_name" "$port" "$test_line"
 
         n=$((n+1))
     done
+
+    stop_server "$server_pid"
 }
 
 # ============================================================
@@ -562,33 +650,33 @@ run_model() {
 
 START_ALL=$(python3 -c 'import time; print(time.time())')
 
-# Resolve llama-cli: env override first, then any existing build dir.
+# Resolve llama-server: env override first, then any existing build dir.
 # If not found, build it once from the vendored llama.cpp fork.
-if [[ -z "$LLAMA_BIN" ]]; then
-    if LLAMA_BIN="$(resolve_llama_cli)"; then
-        echo "Using llama-cli: $LLAMA_BIN"
+if [[ -z "$LLAMA_SERVER" ]]; then
+    if LLAMA_SERVER="$(resolve_llama_server)"; then
+        echo "Using llama-server: $LLAMA_SERVER"
     else
-        echo "llama-cli not found in any build dir."
+        echo "llama-server not found in any build dir."
         if [[ "$LIST" -eq 1 ]]; then
-            echo "Set LLAMA_BIN=/path/to/llama-cli and re-run."
+            echo "Set LLAMA_SERVER=/path/to/llama-server and re-run."
             exit 1
         fi
-        if ! build_llama_cli; then
+        if ! build_llama_server; then
             echo
-            echo "ERROR: could not find or build llama-cli."
-            echo "Set LLAMA_BIN=/path/to/llama-cli and re-run."
+            echo "ERROR: could not find or build llama-server."
+            echo "Set LLAMA_SERVER=/path/to/llama-server and re-run."
             exit 1
         fi
         # Re-resolve now that the build produced a binary.
-        LLAMA_BIN="$(resolve_llama_cli)" || {
+        LLAMA_SERVER="$(resolve_llama_server)" || {
             echo
-            echo "ERROR: build finished but llama-cli not found."
+            echo "ERROR: build finished but llama-server not found."
             exit 1
         }
     fi
 fi
-if [[ ! -x "$LLAMA_BIN" ]]; then
-    echo "ERROR: LLAMA_BIN is not executable: $LLAMA_BIN"
+if [[ ! -x "$LLAMA_SERVER" ]]; then
+    echo "ERROR: LLAMA_SERVER is not executable: $LLAMA_SERVER"
     exit 1
 fi
 
