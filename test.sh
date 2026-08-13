@@ -97,7 +97,7 @@ rm -f "$RESULTS_JSONL"
 # 1.58-bit BitNet I2_S models first, then standard Q4 models.
 # ============================================================
 
-CATALOG_KEYS=(bitnet-2b f3-1b f3-3b f3-7b f3-10b ds-r1-1.5b llama3.1-8b mistral-7b qwen3-8b gemma3-12b ternary-8b)
+CATALOG_KEYS=(f3-1b f3-3b f3-7b f3-10b ds-r1-1.5b llama3.1-8b mistral-7b qwen3-8b gemma3-12b ternary-8b)
 
 # Path to the .gguf inside ./models/ (used when the file is already present).
 declare -A CATALOG_PATH=(
@@ -183,19 +183,22 @@ declare -A CATALOG_NOTE=(
 
 # End-of-turn stop strings per model, taken from each GGUF's chat template.
 # Generation halts when the model emits one of these, so it cannot fabricate
-# follow-up user/assistant turns after its real reply.
+# follow-up user/assistant turns after its real reply. The plain-text "\nuser\n"
+# / "\nassistant\n" markers are included for every model because several 1.58-bit
+# fine-tunes emit bare user/assistant lines instead of their templated special
+# tokens when hallucinating a second turn.
 declare -A CATALOG_STOP=(
-    [bitnet-2b]='["<|end_of_text|>", "Human: "]'
-    [f3-1b]='["<|endoftext|>", "<|user|>"]'
-    [f3-3b]='["<|endoftext|>", "<|user|>"]'
-    [f3-7b]='["<|endoftext|>", "<|user|>"]'
-    [f3-10b]='["<|endoftext|>", "<|user|>"]'
-    [ds-r1-1.5b]='["<|endoftext|>"]'
-    [llama3.1-8b]='["<|eot_id|>", "<|start_header_id|>user<|end_header_id|>"]'
-    [mistral-7b]='["</s>", "[INST]"]'
-    [qwen3-8b]='["<|im_end|>", "<|im_start|>user"]'
-    [gemma3-12b]='["<end_of_turn>", "<start_of_turn>user"]'
-    [ternary-8b]='["<|im_end|>", "<|im_start|>user"]'
+    [bitnet-2b]='["<|end_of_text|>", "Human: ", "\nuser\n", "\nassistant\n"]'
+    [f3-1b]='["<|endoftext|>", "<|user|>", "\nuser\n", "\nassistant\n"]'
+    [f3-3b]='["<|endoftext|>", "<|user|>", "\nuser\n", "\nassistant\n"]'
+    [f3-7b]='["<|endoftext|>", "<|user|>", "\nuser\n", "\nassistant\n"]'
+    [f3-10b]='["<|endoftext|>", "<|user|>", "\nuser\n", "\nassistant\n"]'
+    [ds-r1-1.5b]='["<|endoftext|>", "\nuser\n", "\nassistant\n"]'
+    [llama3.1-8b]='["<|eot_id|>", "<|start_header_id|>user<|end_header_id|>", "\nuser\n", "\nassistant\n"]'
+    [mistral-7b]='["</s>", "[INST]", "\nuser\n", "\nassistant\n"]'
+    [qwen3-8b]='["<|im_end|>", "<|im_start|>user", "\nuser\n", "\nassistant\n"]'
+    [gemma3-12b]='["<end_of_turn>", "<start_of_turn>user", "\nuser\n", "\nassistant\n"]'
+    [ternary-8b]='["<|im_end|>", "<|im_start|>user", "\nuser\n", "\nassistant\n"]'
 )
 
 # ============================================================
@@ -408,7 +411,7 @@ start_server() {
         return 1
     fi
 
-    echo "Started llama-server (pid $pid) on port $port - model resident in RAM"
+    echo "Started llama-server (pid $pid) on port $port - model resident in RAM" >&2
     echo "$pid"
     return 0
 }
@@ -572,6 +575,13 @@ ARTIFACT_TOKENS = [
     "<start_of_turn>", "<end_of_turn>", "[INST]", "[/INST]", "</s>",
 ]
 
+# Distinctive substrings of the system prompt. A response that regurgitates any
+# of these is the model re-emitting its instructions, not answering the customer.
+PROMPT_LEAK = [
+    "reference date:", "payment window:", "pending amount:",
+    "never expose chain-of-thought", "customer message:",
+]
+
 def clean_response(text):
     if not text:
         return ""
@@ -590,9 +600,13 @@ def evaluate(raw, clean):
             return False, f"Template artifact leaked: {a}"
     if "```" in raw or '"decision":' in low or '"payment_date":' in low:
         return False, "Unexpected JSON/markdown output"
-    # A second user:/assistant:/system: turn marker means the model kept
-    # fabricating conversation instead of stopping at its real reply.
-    if re.search(r"(?im)^\s*(user|assistant|system)\s*:", raw):
+    for m in PROMPT_LEAK:
+        if m in low:
+            return False, f"System prompt leaked: {m}"
+    # A fabricated second turn - the model kept generating user/assistant
+    # turns instead of stopping at its real reply. Catches "user:" style,
+    # bare "\nuser\n" lines, and "<assistant>" style markers.
+    if re.search(r"(?im)^\s*(?:user|assistant|system)\s*(?:\n|:|>|$)", raw):
         return False, "Fabricated conversation turn"
     words = re.findall(r"[A-Za-z0-9'-]+", raw)
     if len(words) < 5:
