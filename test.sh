@@ -61,6 +61,23 @@ RESULTS_JSON="$ROOT/benchmark_results.json"
 LLAMA_BIN="${LLAMA_BIN:-}"
 
 mkdir -p "$MODELS_DIR" "$TEMP_DIR"
+
+# The dirs may be root-owned from an earlier `sudo` run; test.sh is
+# running as $USER. Catch this up front with the exact fix.
+for d in "$TEMP_DIR" "$MODELS_DIR"; do
+    if [[ -d "$d" ]] && [[ ! -w "$d" ]]; then
+        echo
+        echo "ERROR: directory is not writable by $USER: $d"
+        echo "It was probably created by 'sudo bash server_benchmark.sh'."
+        echo "Fix ownership and re-run:"
+        echo
+        echo "  sudo chown -R $USER:$USER $ROOT"
+        echo "  bash test.sh"
+        echo
+        exit 1
+    fi
+done
+
 rm -f "$RESULTS_JSONL"
 
 # ============================================================
