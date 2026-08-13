@@ -562,6 +562,12 @@ if [[ -z "$LLAMA_BIN" ]]; then
             echo "Set LLAMA_BIN=/path/to/llama-cli and re-run."
             exit 1
         fi
+        # Re-resolve now that the build produced a binary.
+        LLAMA_BIN="$(resolve_llama_cli)" || {
+            echo
+            echo "ERROR: build finished but llama-cli not found."
+            exit 1
+        }
     fi
 fi
 if [[ ! -x "$LLAMA_BIN" ]]; then
