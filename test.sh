@@ -460,7 +460,7 @@ ASSISTANT:
         "http://127.0.0.1:$port/completion" 2>/dev/null || true)"
 
     local elapsed
-    elapsed=$(python3 -c "print(round(time.time() - $start_ts, 2))")
+    elapsed="$(python3 -c 'import time, sys; print(round(time.time() - float(sys.argv[1]), 2))' "$start_ts" 2>/dev/null || echo 0)"
 
     local stdout=""
     if [[ "$http_code" == "200" ]]; then
@@ -492,7 +492,10 @@ import sys, json, re
 
 exit_code = int(exit_code)
 timed_out = bool(int(timed_out))
-elapsed = float(elapsed)
+try:
+    elapsed = float(elapsed)
+except ValueError:
+    elapsed = 0.0
 ctx = int(ctx)
 predict = int(predict)
 
