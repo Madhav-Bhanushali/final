@@ -58,7 +58,7 @@ RESULTS_JSONL="$ROOT/benchmark_results.jsonl"
 RESULTS_CSV="$ROOT/benchmark_results.csv"
 RESULTS_JSON="$ROOT/benchmark_results.json"
 
-LLAMA_BIN="${LLAMA_BIN:-$ROOT/build/bin/llama-cli}"
+LLAMA_BIN="${LLAMA_BIN:-}"
 
 mkdir -p "$MODELS_DIR" "$TEMP_DIR"
 rm -f "$RESULTS_JSONL"
@@ -225,13 +225,62 @@ if [[ $LIST -eq 1 ]]; then
     exit 0
 fi
 
-if [[ ! -x "$LLAMA_BIN" ]]; then
+# ============================================================
+# LLAMA BINARY RESOLUTION + BUILD
+# ============================================================
+
+# Find an existing llama-cli in any build dir produced by this repo
+# (server_benchmark.sh builds into build_server, the CMake default
+# build/ is used by the Windows Visual Studio build).
+resolve_llama_cli() {
+    local candidates=(
+        "$ROOT/build_server/bin/llama-cli"
+        "$ROOT/build/bin/llama-cli"
+        "$ROOT/build_server/bin/Release/llama-cli"
+        "$ROOT/build/bin/Release/llama-cli"
+    )
+    local c
+    for c in "${candidates[@]}"; do
+        if [[ -x "$c" ]]; then
+            echo "$c"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Build llama-cli from the vendored llama.cpp fork (used by the
+# I2_S / 1.58-bit Falcon3 + BitNet models). Reuses an existing
+# build dir if present, otherwise configures a fresh one.
+build_llama_cli() {
     echo
-    echo "ERROR: llama-cli binary not found or not executable:"
-    echo "$LLAMA_BIN"
-    echo "Set LLAMA_BIN=/path/to/llama-cli or edit the default near the top of this script."
-    exit 1
-fi
+    echo "Building llama-cli (this can take a few minutes)..."
+    echo
+
+    local src="$ROOT"
+    if [[ ! -f "$ROOT/CMakeLists.txt" ]]; then
+        echo "ERROR: repo root with CMakeLists.txt not found at $ROOT"
+        echo "  Clone with: git clone --recurse-submodules https://github.com/Madhav-Bhanushali/final"
+        return 1
+    fi
+
+    local bdir="$ROOT/build_server"
+    local nproc_val
+    nproc_val="$(nproc 2>/dev/null || echo 4)"
+
+    if [[ ! -f "$bdir/CMakeCache.txt" ]]; then
+        cmake -S "$src" -B "$bdir" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_NATIVE=ON \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_COMMON=ON \
+            -DLLAMA_BUILD_TOOLS=ON
+    fi
+
+    cmake --build "$bdir" --target llama-cli --config Release -j "$nproc_val"
+    local exe="$bdir/bin/llama-cli"
+    [[ -x "$exe" ]] && echo "Built: $exe"
+}
 
 # ============================================================
 # DOWNLOAD
@@ -479,6 +528,30 @@ run_model() {
 # ============================================================
 
 START_ALL=$(python3 -c 'import time; print(time.time())')
+
+# Resolve llama-cli: env override first, then any existing build dir.
+# If not found, build it once from the vendored llama.cpp fork.
+if [[ -z "$LLAMA_BIN" ]]; then
+    if LLAMA_BIN="$(resolve_llama_cli)"; then
+        echo "Using llama-cli: $LLAMA_BIN"
+    else
+        echo "llama-cli not found in any build dir."
+        if [[ "$LIST" -eq 1 ]]; then
+            echo "Set LLAMA_BIN=/path/to/llama-cli and re-run."
+            exit 1
+        fi
+        if ! build_llama_cli; then
+            echo
+            echo "ERROR: could not find or build llama-cli."
+            echo "Set LLAMA_BIN=/path/to/llama-cli and re-run."
+            exit 1
+        fi
+    fi
+fi
+if [[ ! -x "$LLAMA_BIN" ]]; then
+    echo "ERROR: LLAMA_BIN is not executable: $LLAMA_BIN"
+    exit 1
+fi
 
 if [[ "$ALL" -eq 1 || "$MODEL" == "all" ]]; then
     echo
