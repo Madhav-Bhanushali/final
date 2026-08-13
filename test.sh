@@ -3,7 +3,7 @@
 # BANK LOAN COLLECTION BENCHMARK - llama-server edition
 # Loads each model ONCE into a resident llama-server (RAM) and runs all
 # tests over HTTP. Uses prompt-prefix caching so the static system prompt
-# is processed only once per model, a hard output token cap, and drops
+# is processed only once per model, per-model output token limits, and drops
 # chain-of-thought. Greatly reduces per-request latency vs llama-cli.
 #
 # Requires: python3, curl, jq
@@ -25,7 +25,7 @@ ALL=0
 LIST=0
 DOWNLOAD_ONLY=0
 PORT=8080
-MAX_PREDICT=80
+MAX_PREDICT=0
 NO_THINK=1
 
 usage() {
@@ -36,7 +36,7 @@ Usage: ./test.sh [options]
                       ds-r1-1.5b | llama3.1-8b | mistral-7b | qwen3-8b |
                       gemma3-12b | ternary-8b | all (default: all)
   --threads N           default: 4
-  --predict N           hard cap on output tokens (default: 80)
+  --predict N           max output-token override (default: 0 = use per-model Predict)
   --timeout SECONDS    default: 300
   --no-think|--think    drop/enable chain-of-thought (default: drop)
   --all                 run every model in the catalog (same as --model all)
@@ -420,8 +420,9 @@ run_test() {
         predict="$MAX_PREDICT"
     fi
 
-    # Reasoning models spew chain-of-thought tokens first. With --no-think
-    # we hard-cap output so the answer/JSON must appear inside the cap.
+    # Reasoning models spew chain-of-thought tokens first. --no-think tells
+    # them to skip thinking; output is capped by the per-model catalog Predict
+    # (or the --predict override).
     local system_prompt="$SYSTEM_PROMPT"
     if [[ "$NO_THINK" -eq 1 ]]; then
         case "$model_name" in
@@ -471,6 +472,14 @@ ASSISTANT:
         echo ""
     fi
 
+    # Timing/cache fields from the server response (task item 5). Zero when the
+    # request failed or the server did not include a timings object.
+    local p_ms g_ms c_n p_n
+    p_ms="$(jq -r '.timings.prompt_ms // 0' "$resp_file" 2>/dev/null || echo 0)"
+    g_ms="$(jq -r '.timings.predicted_ms // 0' "$resp_file" 2>/dev/null || echo 0)"
+    c_n="$(jq -r '.timings.cache_n // 0' "$resp_file" 2>/dev/null || echo 0)"
+    p_n="$(jq -r '.timings.prompt_n // 0' "$resp_file" 2>/dev/null || echo 0)"
+
     local exit_code=0
     local timed_out=0
     if [[ "$http_code" != "200" ]]; then
@@ -484,11 +493,13 @@ ASSISTANT:
     echo "------------------------------------------------------------"
 
     python3 - "$model_name" "$t_id" "$t_cat" "$t_desc" "$t_user" "$t_expected" \
-             "$exit_code" "$timed_out" "$elapsed" "$ctx" "$predict" "$stdout" "$RESULTS_JSONL" <<'PY'
+             "$exit_code" "$timed_out" "$elapsed" "$ctx" "$predict" "$stdout" "$RESULTS_JSONL" \
+             "$p_ms" "$g_ms" "$c_n" "$p_n" <<'PY'
 import sys, json, re
 
 (model_name, t_id, t_cat, t_desc, t_user, t_expected,
- exit_code, timed_out, elapsed, ctx, predict, stdout, results_jsonl) = sys.argv[1:14]
+ exit_code, timed_out, elapsed, ctx, predict, stdout, results_jsonl,
+ p_ms, g_ms, c_n, p_n) = sys.argv[1:18]
 
 exit_code = int(exit_code)
 timed_out = bool(int(timed_out))
@@ -498,6 +509,18 @@ except ValueError:
     elapsed = 0.0
 ctx = int(ctx)
 predict = int(predict)
+
+def to_num(v, default=0.0):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+p_eval = round(to_num(p_ms) / 1000, 4)
+g_eval = round(to_num(g_ms) / 1000, 4)
+pn = int(to_num(p_n))
+cn = int(to_num(c_n))
+cache_hit = bool(pn > 0 and cn >= pn)
 
 VALID_DECISIONS = {"ACCEPT","OUTSIDE_WINDOW","CLARIFY","REDIRECT","POLITE_REDIRECT","SAFE_RESPONSE"}
 UNSAFE_PATTERNS = [
@@ -577,8 +600,9 @@ row = {
     "user_message": t_user, "expected": t_expected, "actual": parsed["decision"],
     "payment_date": parsed["payment_date"], "within_seven_days": parsed["within_window"],
     "pass": ok, "reason": reason, "valid_json": parsed["valid_json"],
-    "response": parsed["response"], "seconds": elapsed, "exit_code": exit_code,
-    "timed_out": timed_out, "context": ctx, "max_tokens": predict,
+    "response": parsed["response"], "seconds": elapsed,
+    "prompt_eval_seconds": p_eval, "gen_eval_seconds": g_eval, "cache_hit": cache_hit,
+    "exit_code": exit_code, "timed_out": timed_out, "context": ctx, "max_tokens": predict,
 }
 
 with open(results_jsonl, "a") as f:
@@ -589,6 +613,7 @@ if not ok:
     print("REASON:", reason)
 print("Decision:", parsed["decision"])
 print(f"Time: {elapsed}s")
+print(f"Prompt eval: {p_eval}s | Gen: {g_eval}s | Cache hit: {'yes' if cache_hit else 'no'}")
 PY
 }
 
@@ -606,7 +631,11 @@ run_model() {
     echo
     echo "Note        : ${CATALOG_NOTE[$model_name]}"
     echo "Context     : ${CATALOG_CTX[$model_name]}"
-    echo "Max tokens  : ${CATALOG_PREDICT[$model_name]} (hard cap $MAX_PREDICT)"
+    if [[ "$MAX_PREDICT" -gt 0 ]]; then
+        echo "Max tokens  : ${CATALOG_PREDICT[$model_name]} (hard cap $MAX_PREDICT)"
+    else
+        echo "Max tokens  : ${CATALOG_PREDICT[$model_name]} (per-model Predict)"
+    fi
     echo "Threads     : $THREADS"
     echo "Timeout     : $TIMEOUT_SECONDS seconds"
     echo
