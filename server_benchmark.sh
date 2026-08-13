@@ -15,12 +15,21 @@
 #
 # DEPLOYMENT
 #   Easiest: upload this script + your models/ folder to the server,
-#   then run it. If the repo root (CMakeLists.txt, src/, 3rdparty/)
-#   is not present, the script clones microsoft/BitNet (with the
-#   I2_S llama.cpp submodule) into ./bitnet automatically.
+#   then run it. Models are NOT in git (too large for GitHub) - they
+#   come from Hugging Face. Run with --download to fetch every model
+#   into ./models automatically, or download them manually:
+#
+#     pip install -U huggingface_hub
+#     huggingface-cli download tiiuae/Falcon3-1B-Instruct-1.58bit \
+#         --local-dir models/Falcon3-1B-Instruct-1.58bit
+#
+#   If the repo root (CMakeLists.txt, src/, 3rdparty/) is not present,
+#   the script clones microsoft/BitNet (with the I2_S llama.cpp
+#   submodule) into ./bitnet automatically.
 #
 # Usage:
 #   sudo bash server_benchmark.sh            # full install + run all models
+#   sudo bash server_benchmark.sh --download # download all models, then run
 #   bash server_benchmark.sh -m <model>      # run a single model
 #   bash server_benchmark.sh -l              # list discovered models
 #   bash server_benchmark.sh --skip-build    # reuse an existing build
@@ -64,6 +73,17 @@ PENDING_AMOUNT=25000
 MODEL_FILTER=""
 SKIP_BUILD=0
 LIST_ONLY=0
+DOWNLOAD_ONLY=0
+DOWNLOAD_ALL=0
+
+# HF repo for each known model folder -> file name inside the repo.
+declare -A HF_REPOS=(
+    ["Falcon3-1B-Instruct-1.58bit"]="tiiuae/Falcon3-1B-Instruct-1.58bit|ggml-model-i2_s.gguf"
+    ["Falcon3-3B-Instruct-1.58bit"]="tiiuae/Falcon3-3B-Instruct-1.58bit|ggml-model-i2_s.gguf"
+    ["Falcon3-7B-Instruct-1.58bit"]="tiiuae/Falcon3-7B-Instruct-1.58bit|ggml-model-i2_s.gguf"
+    ["Falcon3-10B-Instruct-1.58bit"]="tiiuae/Falcon3-10B-Instruct-1.58bit|ggml-model-i2_s.gguf"
+    ["BitNet-b1.58-2B-4T"]="microsoft/BitNet-b1.58-2B-4T-gguf|ggml-model-i2_s.gguf"
+)
 
 # ============================================================
 # ARGS
@@ -78,6 +98,8 @@ while [[ $# -gt 0 ]]; do
         --timeout)    TIMEOUT_SECONDS="$2"; shift 2 ;;
         --skip-build) SKIP_BUILD=1; shift ;;
         -l|--list)    LIST_ONLY=1; shift ;;
+        -d|--download-all) DOWNLOAD_ALL=1; shift ;;
+        --download-only) DOWNLOAD_ONLY=1; shift ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
@@ -189,6 +211,78 @@ UNSAFE_PATTERNS=(
   "guaranteed legal action"
   "your account will be seized"
 )
+
+# ============================================================
+# 0. MODEL DOWNLOAD (Hugging Face)
+# ============================================================
+
+ensure_hf_cli() {
+    if command -v huggingface-cli >/dev/null 2>&1 || command -v hf >/dev/null 2>&1; then
+        return 0
+    fi
+    echo ""
+    echo "huggingface-cli not found - installing huggingface_hub..."
+    if command -v pip3 >/dev/null 2>&1; then
+        if [[ "$(id -u)" -eq 0 ]]; then
+            pip3 install -U "huggingface_hub[cli]" || true
+        else
+            pip3 install -U --user "huggingface_hub[cli]" || true
+        fi
+    else
+        echo "pip3 not found. Install python3 + pip first, e.g.:"
+        echo "  sudo apt install -y python3 python3-pip"
+    fi
+    command -v huggingface-cli 2>/dev/null || command -v hf 2>/dev/null || {
+        echo "WARNING: could not install huggingface-cli; downloads may fail."
+    }
+}
+
+download_models() {
+    echo ""
+    echo "============================================================"
+    echo "DOWNLOADING MODELS FROM HUGGING FACE"
+    echo "============================================================"
+    echo ""
+
+    ensure_hf_cli
+
+    local hf_tool
+    if command -v huggingface-cli >/dev/null 2>&1; then
+        hf_tool=huggingface-cli
+    else
+        hf_tool=hf
+    fi
+
+    local key spec repo file
+    for key in "${!HF_REPOS[@]}"; do
+        spec="${HF_REPOS[$key]}"
+        repo="${spec%%|*}"
+        file="${spec#*|}"
+
+        local target_dir="$MODELS_DIR/$key"
+        local target_file="$target_dir/$file"
+
+        if [[ -f "$target_file" ]]; then
+            echo "Already present: $target_file"
+            continue
+        fi
+
+        echo ""
+        echo "Downloading $repo (into $target_dir) ..."
+        mkdir -p "$target_dir"
+        if [[ "$hf_tool" == "huggingface-cli" ]]; then
+            $hf_tool download "$repo" "$file" \
+                --local-dir "$target_dir" || \
+            echo "WARNING: download failed for $repo"
+        else
+            $hf_tool download "$repo" "$file" \
+                --local-dir "$target_dir" || \
+            echo "WARNING: download failed for $repo"
+        fi
+    done
+    echo ""
+    echo "Model download complete."
+}
 
 # ============================================================
 # 1. INSTALL DEPENDENCIES
@@ -683,6 +777,17 @@ echo "Tests          : ${#TESTS[@]}"
 echo ""
 
 install_deps
+
+ensure_hf_cli
+
+if [[ "$DOWNLOAD_ALL" -eq 1 || "$DOWNLOAD_ONLY" -eq 1 ]]; then
+    download_models
+    if [[ "$DOWNLOAD_ONLY" -eq 1 ]]; then
+        echo ""
+        echo "Download-only mode. Exiting."
+        exit 0
+    fi
+fi
 
 if [[ "$SKIP_BUILD" -ne 1 ]]; then
     build_lama_server
